@@ -1,0 +1,857 @@
+// main.js - Core Logic for Meditation Dopamine Challenge
+
+const AURA_COLORS = [
+    'Black', 'Dark Brown', 'Brown', 'Muddy Red', 'Red', 'Red-Orange', 
+    'Orange', 'Yellow-Orange', 'Yellow', 'Yellow-Green', 'Green', 
+    'Emerald Green', 'Blue-Green', 'Light Blue', 'Blue', 'Indigo', 
+    'Violet', 'Lavender', 'White', 'Silver', 'Gold'
+];
+
+// 21 Milestones scaling up to exactly 108 minutes (6480 seconds) in a curved sequence
+const LEVEL_THRESHOLDS = [
+    0, 30, 60, 120, 180, 240, 330, 450, 600, 780, 990,
+    1230, 1530, 1890, 2310, 2790, 3330, 3990, 4710, 5550, 6480
+];
+
+let gameState = {
+    currentLevel: 0,
+    totalElapsedSeconds: 0,
+    actualSessionSeconds: 0,
+    maxLevelReached: 0,
+    unmovedSeconds: 0,
+    bestUnmovedSeconds: 0,
+    strikes: 0,
+    piePoints: 0,
+    isRunning: false,
+    blurRoom: false,
+    isDemo: false,
+    isPaused: false,
+    usingAudio: false,
+    lastLogin: null,
+    mode: 'normal'
+};
+
+let audioCtx = null;
+
+function initAudio() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+    }
+}
+
+function playLevelUpSound() {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gainNode = audioCtx.createGain();
+    
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(432, audioCtx.currentTime); 
+    osc.frequency.exponentialRampToValueAtTime(108, audioCtx.currentTime + 2.0);
+    
+    gainNode.gain.setValueAtTime(0, audioCtx.currentTime);
+    gainNode.gain.linearRampToValueAtTime(0.5, audioCtx.currentTime + 0.1);
+    gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 3.0);
+    
+    osc.connect(gainNode);
+    gainNode.connect(audioCtx.destination);
+    
+    osc.start();
+    osc.stop(audioCtx.currentTime + 3.0);
+}
+
+function playStrikeSound() {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gainNode = audioCtx.createGain();
+    
+    osc.type = 'square'; 
+    osc.frequency.setValueAtTime(150, audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(40, audioCtx.currentTime + 0.1);
+    
+    gainNode.gain.setValueAtTime(0.3, audioCtx.currentTime);
+    gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.2);
+    
+    osc.connect(gainNode);
+    gainNode.connect(audioCtx.destination);
+    
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.2);
+}
+
+let gameLoopInterval = null;
+
+const BACKGROUNDS = {
+    normal: '',
+    mountain: 'https://images.unsplash.com/photo-1464822759023-fed622ff2c3b?q=80&w=1280&auto=format&fit=crop',
+    river: 'https://images.unsplash.com/photo-1437482078695-73f5ca6c96e2?q=80&w=1280&auto=format&fit=crop',
+    hut: 'https://images.unsplash.com/photo-1542601906990-b4d3fb778b09?q=80&w=1280&auto=format&fit=crop',
+    tree: 'https://images.unsplash.com/photo-1448375240586-882707db885b?q=80&w=1280&auto=format&fit=crop',
+    peak: 'https://images.unsplash.com/photo-1510414842594-a61c69b5ae57?q=80&w=1280&auto=format&fit=crop'
+};
+
+document.addEventListener('DOMContentLoaded', () => {
+    loadProgress();
+    checkDecay();
+    checkAuth();
+    updateUI();
+});
+
+// Calculate required seconds for a given level (30s * level scaling)
+function getLevelDuration(level) {
+    if (level === 1) return 30;
+    return level * 30; 
+}
+
+function getAuraColor(level) {
+    const idx = Math.min(level, AURA_COLORS.length - 1);
+    return AURA_COLORS[idx];
+}
+
+function loadProgress() {
+    const saved = localStorage.getItem('meditation_state');
+    if (saved) {
+        const parsed = JSON.parse(saved);
+        gameState.currentLevel = parsed.currentLevel || 1;
+        gameState.totalPoints = parsed.totalPoints || 0.0;
+        gameState.piePoints = parsed.piePoints || 0;
+        gameState.lastLogin = parsed.lastLogin || Date.now();
+    } else {
+        gameState.lastLogin = Date.now();
+        saveProgress();
+    }
+}
+
+function saveProgress() {
+    gameState.lastLogin = Date.now();
+    localStorage.setItem('meditation_state', JSON.stringify({
+        currentLevel: gameState.currentLevel,
+        totalPoints: gameState.totalPoints,
+        piePoints: gameState.piePoints,
+        lastLogin: gameState.lastLogin
+    }));
+}
+
+function checkDecay() {
+    const now = Date.now();
+    const tenDaysMs = 10 * 24 * 60 * 60 * 1000;
+    if (now - gameState.lastLogin > tenDaysMs) {
+        gameState.currentLevel = Math.max(1, gameState.currentLevel - 1);
+        saveProgress();
+    }
+}
+
+let currentUser = null;
+
+function checkAuth() {
+    const savedUser = localStorage.getItem('meditation_current_user');
+    if (savedUser) {
+        currentUser = JSON.parse(savedUser);
+        document.getElementById('user_name').value = currentUser.name;
+        document.getElementById('user_age').value = currentUser.age || '';
+        document.getElementById('login_screen').classList.add('hidden');
+        document.getElementById('home_screen').classList.remove('hidden');
+        document.getElementById('btn_leaderboard_home').style.display = 'block';
+        updateLifetimeStats();
+    }
+}
+
+function updateLifetimeStats() {
+    if (!currentUser) return;
+    const userKey = currentUser.email || currentUser.name;
+    let history = JSON.parse(localStorage.getItem(`meditation_history_${userKey}`) || "[]");
+    let totalSessions = history.length;
+    let totalSeconds = history.reduce((acc, session) => acc + session.seconds, 0);
+    
+    document.getElementById('stat_sessions').innerText = totalSessions;
+    document.getElementById('stat_minutes').innerText = Math.floor(totalSeconds / 60);
+    
+    // Daily Streak Calculation
+    let streak = 0;
+    if (history.length > 0) {
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        
+        // Get unique session dates (as day-level timestamps)
+        const sessionDays = [...new Set(history.map(s => {
+            const d = new Date(s.date);
+            d.setHours(0, 0, 0, 0);
+            return d.getTime();
+        }))].sort((a, b) => b - a); // Most recent first
+        
+        // Count consecutive days starting from today or yesterday
+        const oneDayMs = 24 * 60 * 60 * 1000;
+        let checkDate = today.getTime();
+        
+        // Allow streak to start from today OR yesterday (in case they haven't meditated today yet)
+        if (sessionDays[0] === checkDate) {
+            streak = 1;
+            checkDate -= oneDayMs;
+        } else if (sessionDays[0] === checkDate - oneDayMs) {
+            streak = 1;
+            checkDate = sessionDays[0] - oneDayMs;
+        }
+        
+        if (streak > 0) {
+            for (let i = 1; i < sessionDays.length; i++) {
+                if (sessionDays[i] === checkDate) {
+                    streak++;
+                    checkDate -= oneDayMs;
+                } else if (sessionDays[i] < checkDate) {
+                    break;
+                }
+            }
+        }
+    }
+    document.getElementById('stat_streak').innerText = streak;
+    
+    // Personal Best Stillness
+    let bestStillness = 0;
+    history.forEach(s => {
+        if (s.bestStreak && s.bestStreak > bestStillness) bestStillness = s.bestStreak;
+    });
+    const bestMin = Math.floor(bestStillness / 60);
+    const bestSec = bestStillness % 60;
+    document.getElementById('stat_best').innerText = `${bestMin}m ${bestSec}s`;
+}
+
+function switchLoginTab(tab) {
+    if (tab === 'signin') {
+        document.getElementById('form_signin').style.display = 'block';
+        document.getElementById('form_signup').style.display = 'none';
+        document.getElementById('btn_tab_signin').style.borderColor = 'var(--accent-gold)';
+        document.getElementById('btn_tab_signup').style.borderColor = 'transparent';
+    } else {
+        document.getElementById('form_signin').style.display = 'none';
+        document.getElementById('form_signup').style.display = 'block';
+        document.getElementById('btn_tab_signup').style.borderColor = 'var(--accent-gold)';
+        document.getElementById('btn_tab_signin').style.borderColor = 'transparent';
+    }
+}
+
+function signUp() {
+    const name = document.getElementById('signup_name').value;
+    const age = document.getElementById('signup_age').value;
+    const email = document.getElementById('signup_email').value;
+    const pass = document.getElementById('signup_pass').value;
+    
+    if (!name || !email || !pass) return alert("Please fill all required fields.");
+    
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) return alert("Please enter a valid email address.");
+    
+    let users = JSON.parse(localStorage.getItem('meditation_users') || "{}");
+    if (users[email]) return alert("Email already registered!");
+    
+    users[email] = { name, age, password: pass };
+    localStorage.setItem('meditation_users', JSON.stringify(users));
+    
+    alert("Mock Confirmation Email has been dispatched! You can now log in.");
+    switchLoginTab('signin');
+    document.getElementById('signin_email').value = email;
+}
+
+function signIn() {
+    const email = document.getElementById('signin_email').value;
+    const pass = document.getElementById('signin_pass').value;
+    
+    let users = JSON.parse(localStorage.getItem('meditation_users') || "{}");
+    
+    if (users[email] && users[email].password === pass) {
+        currentUser = users[email];
+        localStorage.setItem('meditation_current_user', JSON.stringify(currentUser));
+        
+        document.getElementById('user_name').value = currentUser.name;
+        document.getElementById('user_age').value = currentUser.age || '';
+        
+        document.getElementById('login_screen').classList.add('hidden');
+        document.getElementById('home_screen').classList.remove('hidden');
+        document.getElementById('btn_leaderboard_home').style.display = 'block';
+    } else if (email === 'admin' && pass === 'admin') {
+        currentUser = { name: "Admin", age: 99 };
+        localStorage.setItem('meditation_current_user', JSON.stringify(currentUser));
+        
+        document.getElementById('user_name').value = currentUser.name;
+        document.getElementById('user_age').value = currentUser.age || '';
+        
+        document.getElementById('login_screen').classList.add('hidden');
+        document.getElementById('home_screen').classList.remove('hidden');
+        document.getElementById('btn_leaderboard_home').style.display = 'block';
+    } else {
+        alert("Invalid email or password.");
+    }
+}
+
+function logOut() {
+    currentUser = null;
+    localStorage.removeItem('meditation_current_user');
+    
+    document.getElementById('signin_email').value = '';
+    document.getElementById('signin_pass').value = '';
+    
+    document.getElementById('home_screen').classList.add('hidden');
+    document.getElementById('login_screen').classList.remove('hidden');
+    document.getElementById('btn_leaderboard_home').style.display = 'none';
+    closeLeaderboard();
+}
+
+function getModeRadios() {
+    const modeRadios = document.getElementsByName('yoga_mode');
+    for (let i = 0; i < modeRadios.length; i++) {
+        if (modeRadios[i].checked) {
+            return modeRadios[i].value;
+        }
+    }
+    return 'normal';
+}
+
+function toggleLeaderboard() {
+    const p = document.getElementById('leaderboard_panel');
+    const ul = document.getElementById('leaderboard_list');
+    const title = document.getElementById('leaderboard_title');
+    
+    if (p.classList.contains('hidden')) {
+        const mode = getModeRadios();
+        let listHTML = "";
+        
+        if (mode === 'normal') {
+            title.innerText = "NORMAL MASTERS";
+            listHTML = `<li><strong style="color:var(--accent-success)">1.</strong> Siddhartha (Lvl 216)</li>
+                <li><strong style="color:var(--accent-success)">2.</strong> Patanjali (Lvl 190)</li>
+                <li><strong style="color:var(--accent-success)">3.</strong> Rumi (Lvl 150)</li>`;
+        } else if (mode === 'dharana') {
+            title.innerText = "DHARANA (FOCUS)";
+            listHTML = `<li><strong style="color:var(--accent-success)">1.</strong> Focus Monk (Lvl 10)</li>
+                <li><strong style="color:var(--accent-success)">2.</strong> MindfulEye (Lvl 8)</li>`;
+        } else if (mode === 'dhyana') {
+            title.innerText = "DHYANA (CONTEMPLATION)";
+            listHTML = `<li><strong style="color:var(--accent-success)">1.</strong> Zen Master (Lvl 14)</li>
+                <li><strong style="color:var(--accent-success)">2.</strong> Still Water (Lvl 9)</li>`;
+        } else if (mode === 'samadhi') {
+            title.innerText = "SAMADHI MASTERS";
+            listHTML = `<li><strong style="color:var(--accent-success)">1.</strong> Buddha (Lvl 216)</li>
+                <li><strong style="color:var(--accent-success)">2.</strong> Ascended (Lvl 100)</li>`;
+        }
+        
+        if (currentUser && gameState.currentLevel > 1) {
+            listHTML += `<li><strong style="color:var(--accent-gold)">-</strong> ${currentUser.name} (Lvl ${gameState.currentLevel})</li>`;
+        }
+        
+        ul.innerHTML = listHTML;
+        p.classList.remove('hidden');
+    } else {
+        p.classList.add('hidden');
+    }
+}
+
+function closeLeaderboard() {
+    document.getElementById('leaderboard_panel').classList.add('hidden');
+}
+
+// === HOME SCREEN LOGIC === //
+
+function checkTarget() {
+    const val = parseInt(document.getElementById('target_mins').value);
+    if (val > 108) {
+        alert("You are already at Buddha level! Can you please sit for at least 108 mins?");
+    }
+}
+
+function goToMeditation() {
+    initAudio();
+    const name = document.getElementById('user_name').value || 'Wanderer';
+    document.getElementById('user_profile_title').innerText = `${name.toUpperCase()}'S JOURNEY`;
+
+    // Only blur real room, no virtual backgrounds
+    gameState.blurRoom = document.getElementById('bg_blur').checked;
+    
+    const modeRadios = document.getElementsByName('yoga_mode');
+    for (let i = 0; i < modeRadios.length; i++) {
+        if (modeRadios[i].checked) {
+            gameState.mode = modeRadios[i].value;
+            break;
+        }
+    }
+
+    document.getElementById('meditation_screen').style.backgroundImage = "none";
+
+    // Hide EVERYTHING else
+    document.getElementById('login_screen').classList.add('hidden');
+    document.getElementById('home_screen').classList.add('hidden');
+    document.getElementById('btn_leaderboard_home').style.display = 'none';
+    document.getElementById('leaderboard_panel').classList.add('hidden');
+    
+    document.getElementById('meditation_screen').classList.remove('hidden');
+    document.getElementById('btn_toggle_panel').classList.remove('hidden');
+    
+    if (!document.getElementById('preview_panel').classList.contains('force-show')) {
+        document.getElementById('preview_panel').classList.add('hidden');
+    }
+
+    // Load camera right away so user can optionally customize
+    document.getElementById('loading_overlay').classList.remove('hidden');
+    initVision().then(() => {
+        document.getElementById('loading_overlay').classList.add('hidden');
+    });
+
+    updateUI();
+}
+
+function goHome() {
+    clearInterval(gameLoopInterval);
+    
+    document.getElementById('meditation_screen').classList.add('hidden');
+    
+    if (gameState.isDemo) {
+        document.getElementById('login_screen').classList.remove('hidden');
+    } else {
+        document.getElementById('home_screen').classList.remove('hidden');
+        document.getElementById('btn_leaderboard_home').style.display = 'block';
+    }
+    
+    // Reset state
+    gameState = { currentLevel: 0, totalElapsedSeconds: 0, actualSessionSeconds: 0, maxLevelReached: 0, unmovedSeconds: 0, bestUnmovedSeconds: 0, strikes: 0, piePoints: 0, isRunning: false, blurRoom: false, isDemo: false, isPaused: false, usingAudio: false, mode: 'normal' };
+    
+    document.getElementById('level_display').innerText = "1";
+    document.getElementById('preview_panel').classList.remove('hidden');
+}
+
+function togglePreview() {
+    const panel = document.getElementById('preview_panel');
+    const btn = document.getElementById('btn_preview');
+    if (panel.classList.contains('force-show') || !panel.classList.contains('hidden')) {
+        panel.classList.remove('force-show');
+        panel.classList.add('hidden');
+        btn.innerText = "Show Preview Panel (Always ON)";
+    } else {
+        panel.classList.add('force-show');
+        panel.classList.remove('hidden');
+        btn.innerText = "Hide Preview Panel";
+    }
+}
+
+// === MEDITATION LOGIC === //
+
+function startCustomTracking() {
+    if (gameState.isRunning) {
+        alert("Please Pause or Hard Reset before setting custom targets.");
+        return;
+    }
+    isCustomizingTargets = true;
+    customTrackingPoints = []; // reset
+    document.getElementById('status_text').innerText = "CLICK CANVAS TO SELECT TARGET NODES";
+    document.getElementById('status_text').classList.add('status-pulse');
+    document.getElementById('btn_start').classList.add('hidden');
+    document.getElementById('btn_custom').classList.add('hidden');
+    document.getElementById('btn_save_custom').classList.remove('hidden');
+}
+
+function saveCustomTracking() {
+    isCustomizingTargets = false;
+    document.getElementById('status_text').innerText = "AURA READY";
+    document.getElementById('status_text').classList.remove('status-pulse');
+    document.getElementById('btn_start').classList.remove('hidden');
+    document.getElementById('btn_custom').classList.remove('hidden');
+    document.getElementById('btn_save_custom').classList.add('hidden');
+    
+    // Auto start meditation if targets saved!
+    if (!gameState.isRunning) {
+        startGame();
+    }
+}
+
+function toggleSidebar() {
+    const sidebar = document.getElementById('meditation_sidebar');
+    if (sidebar.classList.contains('collapsed')) {
+        sidebar.classList.remove('collapsed');
+    } else {
+        sidebar.classList.add('collapsed');
+    }
+}
+
+function startGame() {
+    if (gameState.isRunning) return;
+    
+    document.getElementById('loading_overlay').classList.remove('hidden');
+    
+    initVision().then(() => {
+        document.getElementById('loading_overlay').classList.add('hidden');
+        document.getElementById('status_text').innerText = "MEDITATING...";
+        document.getElementById('status_text').classList.remove('status-pulse');
+        
+        startCalibration(); // Kick off baseline frame capture
+
+        document.body.classList.add('is-meditating');
+        document.getElementById('btn_start').classList.add('hidden');
+        document.getElementById('playing_controls').classList.remove('hidden');
+
+        // Reset runtime vars
+        gameState.isRunning = true;
+        gameState.isPaused = false;
+        gameState.strikes = 0;
+        gameState.totalElapsedSeconds = 0;
+        gameState.actualSessionSeconds = 0;
+        gameState.maxLevelReached = 0;
+        gameState.unmovedSeconds = 0;
+        gameState.bestUnmovedSeconds = 0;
+        updateStrikesUI();
+        
+        if (gameState.usingAudio && ytPlayer && typeof ytPlayer.playVideo === 'function') {
+            ytPlayer.playVideo();
+        }
+
+        gameLoopInterval = setInterval(gameLoop, 1000);
+    }).catch(err => {
+        alert("Camera required to play.");
+        document.getElementById('loading_overlay').classList.add('hidden');
+    });
+}
+
+function togglePause() {
+    if (!gameState.isRunning) return;
+
+    gameState.isPaused = !gameState.isPaused;
+    const btn = document.getElementById('btn_pause');
+    const statusText = document.getElementById('status_text');
+
+    if (gameState.isPaused) {
+        btn.innerText = "RESUME";
+        statusText.innerText = "PAUSED";
+        statusText.classList.add('status-pulse');
+        if (typeof pauseAuraParticles === 'function') pauseAuraParticles();
+        if (ytPlayer && typeof ytPlayer.pauseVideo === 'function') ytPlayer.pauseVideo();
+    } else {
+        btn.innerText = "PAUSE";
+        statusText.innerText = "MEDITATING...";
+        statusText.classList.remove('status-pulse');
+        if (typeof resumeAuraParticles === 'function') resumeAuraParticles();
+    }
+}
+
+function gameLoop() {
+    if (!gameState.isRunning || gameState.isPaused) return;
+    
+    gameState.totalElapsedSeconds++;
+    gameState.actualSessionSeconds++;
+    gameState.unmovedSeconds++;
+    if (gameState.unmovedSeconds > gameState.bestUnmovedSeconds) {
+        gameState.bestUnmovedSeconds = gameState.unmovedSeconds;
+    }
+    
+    // Core Score logic
+    const pointIncrement = 1 / 3.1413;
+    gameState.totalPoints = (gameState.totalPoints || 0) + pointIncrement;
+    
+    if (gameState.isDemo) {
+        // Fast-Forward: Cycle all 21 colours over 60 seconds (1 level specifically every 3s)
+        gameState.currentLevel = Math.min(20, Math.floor((gameState.totalElapsedSeconds / 60) * 20));
+        
+        if (gameState.totalElapsedSeconds >= 60) {
+            alert("Demo Journey Complete! You rapidly witnessed the full Aura Evolution up to Silver. Now try a real session!");
+            goHome();
+            resetProgress();
+            return;
+        }
+    } else {
+        // Eye tracking violation check!
+        if (gameState.eyesOpen) {
+            if (gameState.totalElapsedSeconds >= 30) {
+                gameState.eyesViolationTimer = (gameState.eyesViolationTimer || 0) + 1;
+                if (gameState.eyesViolationTimer >= 3) {
+                    gameOver("Meditation Failed: Your eyes stayed open too long! They must remain closed.");
+                    return;
+                }
+            }
+        } else {
+            gameState.eyesViolationTimer = 0;
+        }
+
+        // Streaks for Pie Points — frequent dopamine milestones
+        const unmoved = gameState.unmovedSeconds;
+        if (unmoved === 180) { // 3 min
+            awardPiePoints(7);
+            showBonusAlert("🔥 3 MIN STREAK! +7 Pie Points");
+        } else if (unmoved === 300) { // 5 min
+            awardPiePoints(3);
+            showBonusAlert("🧘 5 MIN FOCUS! +3 Pie Points");
+        } else if (unmoved === 600) { // 10 min
+            awardPiePoints(5);
+            showBonusAlert("✨ 10 MIN DEEP CALM! +5 Pie Points");
+        } else if (unmoved === 900) { // 15 min
+            awardPiePoints(5);
+            showBonusAlert("💎 15 MIN MASTERY! +5 Pie Points");
+        } else if (unmoved === 1260) { // 21 min
+            awardPiePoints(7);
+            showBonusAlert("🌟 21 MIN ZEN! +7 Pie Points");
+        } else if (unmoved === 1800) { // 30 min
+            awardPiePoints(10);
+            showBonusAlert("⚡ 30 MIN TRANSCENDENCE! +10 Pie Points");
+        } else if (unmoved === 2700) { // 45 min
+            awardPiePoints(10);
+            showBonusAlert("🌊 45 MIN ASCENDING! +10 Pie Points");
+        } else if (unmoved === 3600) { // 60 min
+            awardPiePoints(15);
+            showBonusAlert("👁️ 1 HOUR ENLIGHTENED! +15 Pie Points");
+        } else if (unmoved === 6480) { // 108 min
+            awardPiePoints(21);
+            showBonusAlert("🪷 108 MIN — BUDDHA STATE! +21 Pie Points");
+        }
+        
+        // Pie Points directly accelerate Aura Evolution! (1 Pie Point = 60s boost)
+        let effectiveSeconds = gameState.totalElapsedSeconds + (gameState.piePoints * 60);
+
+        let newLevel = calculateNewLevel(effectiveSeconds);
+        
+        if (newLevel > gameState.currentLevel) {
+            playLevelUpSound();
+            const newColorName = getAuraColor(newLevel);
+            const newColorHex = getAuraHexColor(newColorName);
+            if (typeof burstAuraParticles === 'function') burstAuraParticles(newColorHex);
+        }
+        gameState.currentLevel = newLevel;
+        if (newLevel > gameState.maxLevelReached) gameState.maxLevelReached = newLevel;
+    }
+    
+    updateUI();
+}
+
+function calculateNewLevel(effectiveSeconds) {
+    let newLevel = 0;
+    if (gameState.mode === 'dharana') {
+        newLevel = Math.min(20, Math.floor(effectiveSeconds / 21));
+    } else if (gameState.mode === 'dhyana') {
+        newLevel = Math.min(20, Math.floor(effectiveSeconds / 48));
+    } else if (gameState.mode === 'samadhi') {
+        newLevel = Math.min(20, Math.floor(effectiveSeconds / 108));
+    } else {
+        for (let i = 0; i < LEVEL_THRESHOLDS.length; i++) {
+            if (effectiveSeconds >= LEVEL_THRESHOLDS[i]) {
+                newLevel = i;
+            }
+        }
+    }
+    return newLevel;
+}
+
+function awardPiePoints(pts) {
+    gameState.piePoints += pts;
+    saveProgress();
+    updateUI();
+}
+
+function showBonusAlert(msg) {
+    const el = document.getElementById('status_text');
+    el.innerText = msg;
+    el.style.color = 'var(--accent-gold)';
+    setTimeout(() => {
+        el.innerText = "MEDITATING...";
+        el.style.color = '';
+    }, 4000);
+}
+
+function registerStrike() {
+    if (!gameState.isRunning || gameState.isPaused) return;
+    
+    if (window.lastStrike && (Date.now() - window.lastStrike < 2000)) return;
+    window.lastStrike = Date.now();
+    
+    gameState.strikes++;
+    gameState.unmovedSeconds = 0; // Reset streak on movement
+    
+    // Deduct Pie Points on movement (escalating: 3 on strike 1, 5 on strike 2)
+    const piePenalty = gameState.strikes === 1 ? 3 : 5;
+    const pointsLost = Math.min(gameState.piePoints, piePenalty);
+    gameState.piePoints -= pointsLost;
+    
+    const oldColorName = getAuraColor(gameState.currentLevel);
+    const oldColorHex = getAuraHexColor(oldColorName);
+    
+    if (typeof burstAuraParticles === 'function') burstAuraParticles(oldColorHex);
+
+    playStrikeSound();
+
+    if (gameState.strikes === 1) {
+        // Proportional: lose 50% of elapsed time, minimum 30s so even early strikes hurt
+        const timeLoss = Math.max(30, Math.floor(gameState.totalElapsedSeconds * 0.5));
+        gameState.totalElapsedSeconds = Math.max(0, gameState.totalElapsedSeconds - timeLoss);
+        // Deduct 30% of accumulated score points
+        gameState.totalPoints = Math.max(0, (gameState.totalPoints || 0) * 0.7);
+        const lostMins = Math.floor(timeLoss / 60);
+        const lostSecs = timeLoss % 60;
+        showBonusAlert(`Strike 1! Lost ${lostMins}m ${lostSecs}s! Aura disintegrating!`);
+    } else if (gameState.strikes === 2) {
+        // Proportional: lose 75% of elapsed time, minimum 60s
+        const timeLoss = Math.max(60, Math.floor(gameState.totalElapsedSeconds * 0.75));
+        gameState.totalElapsedSeconds = Math.max(0, gameState.totalElapsedSeconds - timeLoss);
+        // Deduct 60% of accumulated score points
+        gameState.totalPoints = Math.max(0, (gameState.totalPoints || 0) * 0.4);
+        const lostMins = Math.floor(timeLoss / 60);
+        const lostSecs = timeLoss % 60;
+        showBonusAlert(`Strike 2! Lost ${lostMins}m ${lostSecs}s! Aura crumbling!`);
+    } else if (gameState.strikes >= 3) {
+        if (gameState.isDemo) {
+            const retry = confirm("Demo Failed: You have been moving! You must remain completely unmoved.\n\nClick OK to Restart the 1-Min Demo, or Cancel to go back to Home.");
+            if (retry) { resetProgress(); runOneMinDemo(); } else { goHome(); }
+            return;
+        }
+        gameOver("Aura Broken: You moved 3 times! Please minimize body movement.");
+        return;
+    }
+    
+    // Immediately Recalculate Level to instantly downgrade color
+    let effectiveSeconds = gameState.totalElapsedSeconds + (gameState.piePoints * 60);
+    gameState.currentLevel = calculateNewLevel(effectiveSeconds);
+
+    updateUI();
+    updateStrikesUI();
+}
+
+function gameOver(msg = "Aura Broken: Please remain incredibly still.") {
+    gameState.isRunning = false;
+    gameState.isPaused = false;
+    clearInterval(gameLoopInterval);
+
+    document.body.classList.remove('is-meditating');
+    document.getElementById('btn_start').classList.remove('hidden');
+    document.getElementById('btn_start').innerText = "RETRY";
+    document.getElementById('playing_controls').classList.add('hidden');
+    document.getElementById('btn_pause').innerText = "PAUSE";
+
+    document.getElementById('status_text').innerText = "SESSION ENDED";
+    document.getElementById('status_text').classList.add('status-pulse');
+    
+    if (ytPlayer && typeof ytPlayer.pauseVideo === 'function') ytPlayer.pauseVideo();
+    
+    // Save to history using actualSessionSeconds so time isn't lost due to strikes
+    if (currentUser && gameState.actualSessionSeconds > 0 && !gameState.isDemo) {
+        let history = JSON.parse(localStorage.getItem(`meditation_history_${currentUser.email || currentUser.name}`) || "[]");
+        history.push({
+            date: Date.now(),
+            seconds: gameState.actualSessionSeconds,
+            maxLevel: gameState.maxLevelReached,
+            piePoints: gameState.piePoints,
+            strikes: gameState.strikes,
+            bestStreak: gameState.bestUnmovedSeconds
+        });
+        localStorage.setItem(`meditation_history_${currentUser.email || currentUser.name}`, JSON.stringify(history));
+    }
+    
+    showReportCard();
+    gameState.totalElapsedSeconds = 0; // Lost level progress
+    gameState.actualSessionSeconds = 0;
+    saveProgress();
+}
+
+function showReportCard() {
+    // Show actual wall-clock time, not the penalized totalElapsedSeconds
+    const m = Math.floor(gameState.actualSessionSeconds / 60).toString().padStart(2, '0');
+    const s = (gameState.actualSessionSeconds % 60).toString().padStart(2, '0');
+    
+    document.getElementById('rc_time').innerText = `${m}:${s}`;
+    document.getElementById('rc_level').innerText = gameState.maxLevelReached;
+    document.getElementById('rc_strikes').innerText = gameState.strikes;
+    document.getElementById('rc_points').innerText = `+${gameState.piePoints}`;
+    
+    // Best stillness streak this session
+    const bm = Math.floor(gameState.bestUnmovedSeconds / 60);
+    const bs = gameState.bestUnmovedSeconds % 60;
+    document.getElementById('rc_best_streak').innerText = `${bm}m ${bs}s`;
+    
+    document.getElementById('report_card').classList.remove('hidden');
+}
+
+function closeReportCard() {
+    document.getElementById('report_card').classList.add('hidden');
+    goHome();
+    updateLifetimeStats();
+    resetProgress();
+}
+
+function stopSession() {
+    if (!gameState.isRunning) return;
+    gameOver("Session Terminated By User");
+}
+
+function updateUI() {
+    document.getElementById('level_display').innerText = gameState.currentLevel;
+    document.getElementById('points_display').innerText = gameState.totalPoints.toFixed(2);
+    document.getElementById('pie_display').innerText = gameState.piePoints;
+    
+    const auraColorName = getAuraColor(gameState.currentLevel);
+    document.getElementById('aura_display').innerText = auraColorName;
+    
+    const hexColor = getAuraHexColor(auraColorName);
+    document.documentElement.style.setProperty('--aura-color', hexColor);
+    
+    // Submerge animation effect for Normal background if normal mode
+    if (gameState.mode === 'normal') {
+        // Just make sure the color transitions smoothly
+    }
+    
+    const mins = Math.floor(gameState.totalElapsedSeconds / 60).toString().padStart(2, '0');
+    const secs = (gameState.totalElapsedSeconds % 60).toString().padStart(2, '0');
+    document.getElementById('timer_text').innerText = `${mins}:${secs}`;
+}
+
+// Helper for UI Time
+function formatTime(seconds) {
+    const m = Math.floor(seconds / 60).toString().padStart(2, '0');
+    const s = (seconds % 60).toString().padStart(2, '0');
+    return `${m}:${s}`;
+}
+
+function runOneMinDemo() {
+    gameState.isDemo = true;
+    document.getElementById('user_name').value = "Demo Meditator";
+    document.getElementById('target_mins').value = 1;
+    
+    // Hide customization UI logic for demo specifically
+    document.getElementById('btn_custom').classList.add('hidden');
+    document.getElementById('status_text').innerText = "CALIBRATING DEMO MODULE...";
+    
+    goToMeditation();
+    
+    // Auto-initiate Demo
+    setTimeout(() => {
+        if (!gameState.isRunning && visionInitialized) startGame();
+    }, 2000);
+}
+
+function getAuraHexColor(name) {
+    const map = {
+        'Black': '#000000', 'Dark Brown': '#3e2723', 'Brown': '#5d4037', 
+        'Muddy Red': '#bf360c', 'Red': '#f44336', 'Red-Orange': '#ff5722', 
+        'Orange': '#ff9800', 'Yellow-Orange': '#ffb300', 'Yellow': '#ffeb3b', 
+        'Yellow-Green': '#cddc39', 'Green': '#4caf50', 'Emerald Green': '#00e676', 
+        'Blue-Green': '#00bfa5', 'Light Blue': '#03a9f4', 'Blue': '#2196f3', 
+        'Indigo': '#3f51b5', 'Violet': '#9c27b0', 'Lavender': '#e1bee7', 
+        'White': '#ffffff', 'Gold': '#ffd700', 'Silver': '#c0c0c0'
+    };
+    return map[name] || '#000000';
+}
+
+function updateStrikesUI() {
+    for (let i = 1; i <= 3; i++) {
+        const str = document.getElementById(`strike_${i}`);
+        if (i <= gameState.strikes) {
+            str.classList.add('active');
+        } else {
+            str.classList.remove('active');
+        }
+    }
+}
+
+function resetProgress() {
+    if (confirm("Are you sure you want to hard reset all progress?")) {
+        gameState.currentLevel = 0;
+        gameState.totalElapsedSeconds = 0;
+        gameState.actualSessionSeconds = 0;
+        gameState.piePoints = 0;
+        gameState.unmovedSeconds = 0;
+        saveProgress();
+        updateUI();
+    }
+}
+
